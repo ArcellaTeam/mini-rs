@@ -37,4 +37,8 @@ pub enum MiniStoreError {
     PathIsNotFile {
         path: PathBuf,
     },
+
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String)
+
 }
