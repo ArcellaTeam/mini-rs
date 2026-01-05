@@ -34,14 +34,21 @@
 //!
 //! The on-disk journal is a text file in [JSONL](http://jsonlines.org/) format:
 //! ```text
-//! // MINISTORE JOURNAL v0.1.0
+//! // MINISTORE JOURNAL v0.1.4
 //! {"Set":{"value":10}}
 //! {"Inc":{"by":5}}
 //! ```
 //! - Line 1: magic header (for versioning and validation).
-//! - Line N (N ≥ 2): one JSON-serialized record per line.
+//! - Line N (N e 2): one JSON-serialized record per line.
 //!
 //! The format is human-readable and easy to inspect/debug with standard tools (`cat`, `jq`, etc.).
+//!
+//! # Segmented Rotation
+//!
+//! To prevent unbounded growth, `ministore` supports **segmented WAL rotation**:
+//! - When a segment reaches `max_bytes_per_segment`, it is renamed to `journal.jsonl.001`, etc.
+//! - Only up to `max_segments` files are retained. Oldest are deleted automatically.
+//! - `replay()` reads all segments in order: `.001`, `.002`, ..., then active `journal.jsonl`.
 //!
 //! # Example: Simple Counter
 //!
@@ -95,7 +102,7 @@
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::{
     fs::{OpenOptions, File},
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Lines},
@@ -114,16 +121,65 @@ pub type Result<T> = std::result::Result<T, MiniStoreError>;
 /// - Identify the file as a `ministore` journal.
 /// - Validate the journal version during replay.
 /// - Prevent accidental corruption by external tools.
-const JOURNAL_MAGIC_CURRENT: &str = "// MINISTORE JOURNAL v0.1.3\n";
+const JOURNAL_MAGIC_CURRENT: &str = "// MINISTORE JOURNAL v0.1.4\n";
 
 /// Prefix of the magic header (without version).
 const JOURNAL_MAGIC_PREFIX: &str = "// MINISTORE JOURNAL v";
 
+/// Configuration for `MiniStore` with support for segmented WAL rotation.
+///
+/// By default:
+/// - `max_bytes_per_segment = 64 MiB`
+/// - `max_segments = 3`
+///
+/// You can customize these via the builder pattern.
+#[derive(Debug, Clone)]
+pub struct MiniStoreOptions {
+    /// Maximum size (in bytes) of a single journal segment before rotation.
+    pub max_bytes_per_segment: u64,
+    /// Maximum number of segments to retain (including the active file).
+    /// Must be >= 1.
+    pub max_segments: usize,
+}
+
+impl MiniStoreOptions {
+    /// Creates a new set of options with default values:
+    /// - 64 MiB per segment
+    /// - 3 total segments
+    pub fn new() -> Self {
+        Self {
+            max_bytes_per_segment: 64 * 1024 * 1024, // 64 MiB by default
+            max_segments: 3,
+        }
+    }
+
+    /// Sets the maximum size (in bytes) for a single journal segment.
+    pub fn max_bytes_per_segment(mut self, bytes: u64) -> Self {
+        self.max_bytes_per_segment = bytes;
+        self
+    }
+
+    /// Sets the maximum number of journal segments to retain.
+    ///
+    /// The oldest segments are deleted when this limit is exceeded.
+    /// Must be at least 1.
+    pub fn max_segments(mut self, n: usize) -> Self {
+        self.max_segments = n;
+        self
+    }
+
+    /// Opens a `MiniStore` with these configuration options.
+    pub async fn open<P: AsRef<Path>>(self, path: P) -> Result<MiniStore> {
+        MiniStore::open_with_options(path.as_ref(), self).await
+    }
+}
+
 /// A durable, append-only log store for serializable records.
 ///
-/// `MiniStore` manages a single journal file on disk. It provides two core operations:
-/// - [`append`](Self::append): write a record to the log and guarantee it is on disk.
-/// - [`replay`](Self::replay): read all records from a log file (static method).
+/// `MiniStore` manages a journal file (or set of rotated segments) on disk.
+/// It provides two core operations:
+/// - [`append`](Self::append): write a record and guarantee durability.
+/// - [`replay`](Self::replay): read all records in order (static method).
 ///
 /// # Concurrency
 ///
@@ -131,20 +187,30 @@ const JOURNAL_MAGIC_PREFIX: &str = "// MINISTORE JOURNAL v";
 /// synchronization primitive like `Arc<RwLock<MiniStore>>` (for write-heavy workloads)
 /// or `Arc<Mutex<MiniStore>>`.
 ///
-/// # Durability
+/// # Durability & Rotation
 ///
-/// Every call to [`append`] performs an `fsync` before returning, ensuring the record survives
-/// process crashes and power loss. This makes writes **slow but safe** — perfect for metadata
-/// or infrequent state changes.
+/// - Every `append()` performs an `fsync` before returning.
+/// - When the active segment reaches `max_bytes_per_segment`, it is rotated:
+///   - Closed, renamed to `journal.jsonl.001`, etc.
+///   - A new active file is created.
+/// - Only `max_segments` files are kept; older ones are deleted.
+/// - `replay()` automatically reads all segments in correct order.
 #[derive(Debug)]
 pub struct MiniStore {
-    /// Buffered writer to the journal file.
-    /// Ensures efficient disk I/O while maintaining durability via explicit `flush`/`sync`.
-    journal_writer: BufWriter<tokio::fs::File>,
+    /// Base path of the active journal (e.g., `journal.jsonl`).
+    base_path: PathBuf,
+    /// Rotation and size configuration.
+    opts: MiniStoreOptions,
+    /// Buffered writer to the active journal file.
+    journal_writer: Option<BufWriter<File>>,
+    /// Current size of the active journal in bytes (including header).
+    current_size: u64,
 }
 
 impl MiniStore {
-    /// Opens a `ministore` journal at the given path.
+    /// Opens a `ministore` journal at the given path with default options.
+    ///
+    /// Equivalent to `MiniStoreOptions::new().open(path)`.
     ///
     /// # Behavior
     ///
@@ -159,17 +225,24 @@ impl MiniStore {
     /// - The path is not writable.
     /// - Parent directories cannot be created.
     /// - Disk I/O fails during magic header write.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use ministore::MiniStore;
-    /// # #[tokio::main(flavor = "current_thread")] async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let store = MiniStore::open("/tmp/myapp.log").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        MiniStoreOptions::new().open(path).await
+    }
+
+    /// Opens a `ministore` with explicit rotation settings.
+    ///
+    /// See [`MiniStoreOptions`] for configuration details.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MiniStoreError::InvalidArgument` if `max_segments == 0`.
+    async fn open_with_options<P: AsRef<Path>>(path: P, opts: MiniStoreOptions) -> Result<Self> {
+        if opts.max_segments == 0 {
+            return Err(MiniStoreError::InvalidArgument(
+                "max_segments must be >= 1".into(),
+            ));
+        }
+
         let path = path.as_ref();
 
         // Ensure parent directory exists
@@ -186,22 +259,37 @@ impl MiniStore {
             .await?;
 
         let metadata = file.metadata().await?;
+        if metadata.is_dir() {
+            return Err(MiniStoreError::PathIsNotFile {
+                path: path.to_path_buf(),
+            });
+        }
         let mut journal_writer = BufWriter::new(file);
+
+        let mut current_size = metadata.len();
 
         // Initialize empty file with magic header
         if metadata.len() == 0 {
             journal_writer.write_all(JOURNAL_MAGIC_CURRENT.as_bytes()).await?;
             journal_writer.flush().await?;
             journal_writer.get_ref().sync_all().await?;
+            current_size = JOURNAL_MAGIC_CURRENT.len() as u64;
         }
 
-        Ok(Self { journal_writer })
+        Ok(Self {
+            base_path: path.to_path_buf(),
+            opts,
+            journal_writer: Some(journal_writer),
+            current_size,
+        })
     }
 
     /// Appends a serializable record to the journal and ensures it is durably stored.
     ///
     /// The record is serialized as a single JSON line and immediately `fsync`ed to disk.
-    /// This operation is **atomic** — either the entire record is written, or nothing is.
+    /// This operation is **atomic**  either the entire record is written, or nothing is.
+    ///
+    /// If the active segment exceeds `max_bytes_per_segment`, it is rotated before return.
     ///
     /// # Guarantees
     ///
@@ -220,45 +308,52 @@ impl MiniStore {
     ///
     /// This is a **slow** operation due to the `fsync`. Use it for critical metadata,
     /// not high-frequency data.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use ministore::MiniStore;
-    /// # #[derive(serde::Serialize)] struct Event { id: u32 }
-    /// # #[tokio::main(flavor = "current_thread")] async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut store = MiniStore::open("/tmp/events.log").await?;
-    /// store.append(&Event { id: 42 }).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn append<R>(&mut self, record: &R) -> Result<()>
     where
         R: Serialize,
     {
         let json = serde_json::to_string(record)?;
-        self.journal_writer.write_all(json.as_bytes()).await?;
-        self.journal_writer.write_all(b"\n").await?;
-        self.journal_writer.flush().await?;
-        self.journal_writer.get_ref().sync_all().await?;
+
+        let writer = self
+            .journal_writer
+            .as_mut()
+            .ok_or(MiniStoreError::Io {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "journal closed",
+                ),
+            })?;
+
+        writer.write_all(json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        writer.get_ref().sync_all().await?;
+
+        let record_size = json.len() as u64 + 1;
+        self.current_size += record_size;
+
+        if self.current_size >= self.opts.max_bytes_per_segment {
+            self.rotate().await?;
+        }
+
         Ok(())
     }
 
-    /// Replays all records from a journal file as a `Vec` of strongly-typed values.
+    /// Replays all records from a journal (including rotated segments) as a `Vec` of strongly-typed values.
     ///
-    /// This is a **static method** — it does not require an open `MiniStore` instance.
-    /// It reads the file from disk, validates the magic header, and deserializes each line.
+    /// This is a **static method**  it does not require an open `MiniStore` instance.
     ///
     /// # Behavior
     ///
-    /// - If the file **does not exist** or is **empty**, returns an empty `Vec`.
-    /// - The **first line** must be the exact [`JOURNAL_MAGIC`] string (without trailing newline).
-    /// - Subsequent lines must be valid JSON representations of type `R`.
+    /// - Scans the directory for files matching `base.001`, `base.002`, etc.
+    /// - Reads segments in ascending order (`.001` � `.002` � ... � active file).
+    /// - Validates magic header in each file.
+    /// - If the journal **does not exist** or is **empty**, returns an empty `Vec`.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The magic header is missing or invalid.
+    /// - Any segment has a missing or invalid magic header.
     /// - Any line fails to deserialize as type `R`.
     /// - File I/O fails (e.g., permission denied).
     ///
@@ -277,40 +372,134 @@ impl MiniStore {
         R: DeserializeOwned,
     {
         let path = path.as_ref();
-        if !path.exists() || tokio::fs::metadata(path).await?.len() == 0 {
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let stem = path.file_name().unwrap_or_default();
+
+        if !dir.exists() {
             return Ok(vec![]);
         }
 
-        let file = OpenOptions::new().read(true).open(path).await?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-
-        // Validate magic header
-        validate_magic_header(&mut lines).await?;
-
-        let mut records = Vec::new();
-        let mut line_num = 2; // magic = line 1
-
-        while let Some(line) = lines.next_line().await? {
-            match serde_json::from_str(&line) {
-                Ok(record) => records.push(record),
-                Err(e) => {
-                    return Err(MiniStoreError::Deserialize {
-                        line: line_num,
-                        source: e,
-                    });
+        // Collect and sort archived segments: journal.jsonl.001, .002, ...
+        let mut segments: Vec<(u32, PathBuf)> = vec![];
+        let read_dir_result = tokio::fs::read_dir(dir).await;
+        let mut read_dir = match read_dir_result {
+            Ok(rd) => rd,
+            Err(e) => {
+                return Err(MiniStoreError::Io {
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to read directory {:?}: {}", dir, e),
+                    ),
+                });
+            }
+        };
+        while let Some(entry) = read_dir.next_entry().await? {
+            let p = entry.path();
+            if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                if ext.len() == 3 && ext.chars().all(|c| c.is_ascii_digit()) {
+                    if p.file_stem() == Some(stem) {
+                        if let Ok(num) = ext.parse::<u32>() {
+                            segments.push((num, p));
+                        }
+                    }
                 }
             }
-            line_num += 1;
+        }
+        segments.sort_by_key(|(n, _)| *n);
+
+        let mut current_line_num = 2; // magic = line 1
+        let mut all_records = Vec::new();
+
+        // Read archived segments in order
+        for (_, seg_path) in segments {
+            let lines_read =
+                read_records_from_file(&seg_path, &mut all_records, current_line_num).await?;
+            current_line_num += lines_read;
         }
 
-        Ok(records)
+        // Read active journal file (without suffix), if it exists and is non-empty
+        if path.exists() && tokio::fs::metadata(path).await?.len() > 0 {
+            read_records_from_file(path, &mut all_records, current_line_num).await?;
+        }
+
+        Ok(all_records)
     }
 
-    /// Returns a stream (line iterator) over the records in the journal.
+    /// Performs rotation of the active journal segment.
+    ///
+    /// Steps:
+    /// 1. `fsync` and close the active file.
+    /// 2. Rename it to `base.001`, `base.002`, etc.
+    /// 3. Delete oldest segments if count > `max_segments - 1`.
+    /// 4. Create a new active file with magic header.
+    ///
+    /// This method is called automatically from `append()` when size limit is reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors if rename, create, or delete fails.
+    async fn rotate(&mut self) -> Result<()> {
+        let old_writer = self
+            .journal_writer
+            .take()
+            .ok_or(MiniStoreError::Io {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "journal closed",
+                ),
+            })?;
+
+        // 1. fsync and close
+        let old_file = old_writer.into_inner();
+        old_file.sync_all().await?;
+        drop(old_file);
+
+        // 2. Collect existing segments
+        let mut segments = collect_segments(self.base_path.as_path()).await?;
+
+        // 3. Determine next segment number
+        let next_num = segments.last().map(|(n, _)| *n + 1).unwrap_or(1);
+
+        // 4. Rename active file
+        let new_segment_path = PathBuf::from(format!("{}.{:03}", self.base_path.display(), next_num));
+        tokio::fs::rename(&self.base_path, &new_segment_path).await?;
+
+        // 5. Enforce max_segments: keep only (max_segments - 1) old segments
+        segments.push((next_num, new_segment_path));
+        segments.sort_by_key(|(n, _)| *n);
+
+        if segments.len() > (self.opts.max_segments - 1) {
+            let to_remove = segments.len() - (self.opts.max_segments - 1);
+            for (_, path) in segments.drain(..to_remove) {
+                tokio::fs::remove_file(path).await.ok();
+            }
+        }
+
+        // 6. Create new active file
+        let new_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.base_path)
+            .await?;
+
+        let mut new_writer = BufWriter::new(new_file);
+        new_writer.write_all(JOURNAL_MAGIC_CURRENT.as_bytes()).await?;
+        new_writer.flush().await?;
+        new_writer.get_ref().sync_all().await?;
+
+        self.journal_writer = Some(new_writer);
+        self.current_size = JOURNAL_MAGIC_CURRENT.len() as u64;
+
+        Ok(())
+    }
+
+    /// Returns a stream (line iterator) over the records in a single journal file.
     ///
     /// Each line is parsed on-demand as `Result<T, MiniStoreError>`.
     /// This avoids loading the entire journal into memory.
+    ///
+    /// **Note**: this function reads **only one file**, not rotated segments.
+    /// Use [`replay`] to read the full journal history.
     pub async fn stream<T>(path: impl AsRef<Path>) -> Result<JournalStream<T>>
     where
         T: for<'de> Deserialize<'de>,
@@ -320,7 +509,7 @@ impl MiniStore {
         let mut lines = reader.lines();
         validate_magic_header(&mut lines).await?;
         Ok(JournalStream {
-            lines: lines,
+            lines,
             line_number: 2, // magic = line 1, start at 2
             _phantom: PhantomData,
         })
@@ -328,8 +517,13 @@ impl MiniStore {
 }
 
 /// Validates the magic header of a journal file.
+///
+/// Expects the first line to start with `// MINISTORE JOURNAL v`.
+///
+/// # Errors
+///
+/// Returns `MiniStoreError::MissingInitialState` if header is missing or invalid.
 async fn validate_magic_header(lines: &mut Lines<BufReader<File>>) -> Result<()> {
-    // Validate magic header
     let magic = lines
         .next_line()
         .await?
@@ -340,6 +534,77 @@ async fn validate_magic_header(lines: &mut Lines<BufReader<File>>) -> Result<()>
     Ok(())
 }
 
+/// Collects all rotated journal segments matching the base path.
+///
+/// Returns a sorted list of `(segment_number, path)` pairs.
+async fn collect_segments(base: &Path) -> Result<Vec<(u32, PathBuf)>> {
+    let mut segments = Vec::new();
+    let dir = base.parent().unwrap_or(Path::new("."));
+    let stem = base.file_name().unwrap_or_default();
+
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+            if ext.len() == 3 && ext.chars().all(|c| c.is_ascii_digit()) {
+                if path.file_stem() == Some(stem) {
+                    if let Ok(num) = ext.parse::<u32>() {
+                        segments.push((num, path));
+                    }
+                }
+            }
+        }
+    }
+    segments.sort_by_key(|(n, _)| *n);
+    Ok(segments)
+}
+
+/// Reads all records from a single journal file (including magic header validation)
+/// and appends them to the provided vector.
+///
+/// Returns the number of data lines read (excluding the magic header),
+/// or an error if the file is invalid.
+async fn read_records_from_file<R: DeserializeOwned>(
+    path: &Path,
+    records: &mut Vec<R>,
+    mut line_num: usize, // starting line number for error reporting (usually 2)
+) -> Result<usize> {
+    let file = OpenOptions::new().read(true).open(path).await?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    // Validate magic header (line 1)
+    let magic = lines
+        .next_line()
+        .await?
+        .ok_or(MiniStoreError::MissingInitialState)?;
+    if !magic.starts_with(JOURNAL_MAGIC_PREFIX) {
+        return Err(MiniStoreError::MissingInitialState);
+    }
+
+    let mut count = 0;
+    while let Some(line) = lines.next_line().await? {
+        match serde_json::from_str(&line) {
+            Ok(record) => {
+                records.push(record);
+                count += 1;
+            }
+            Err(e) => {
+                return Err(MiniStoreError::Deserialize {
+                    line: line_num,
+                    source: e,
+                });
+            }
+        }
+        line_num += 1;
+    }
+
+    Ok(count)
+}
+
+/// A stream over records in a single journal file.
+///
+/// Records are parsed on-demand. Does **not** include rotated segments.
 pub struct JournalStream<T> {
     lines: Lines<BufReader<File>>,
     line_number: u64, // start at 2 (after header)
@@ -351,6 +616,9 @@ where
     T: for<'de> Deserialize<'de>,
 {
     /// Asynchronously yields the next record from the journal.
+    ///
+    /// Returns `None` when the file ends.
+    /// Returns `Some(Err(...))` on I/O or deserialization error.
     pub async fn next(&mut self) -> Option<Result<T>> {
         match self.lines.next_line().await {
             Ok(Some(line)) => {
@@ -371,7 +639,7 @@ where
                 }
             }
             Ok(None) => None,
-            Err(e) => Some(Err(MiniStoreError::Io { source: e})),
+            Err(e) => Some(Err(MiniStoreError::Io { source: e })),
         }
     }
 }
@@ -441,7 +709,7 @@ mod tests {
         write!(file, "{}", JOURNAL_MAGIC_CURRENT).unwrap();
         file.flush().unwrap();
 
-        let mut stream: JournalStream<TestMutation>  = MiniStore::stream(file.path()).await.unwrap();
+        let mut stream: JournalStream<TestMutation> = MiniStore::stream(file.path()).await.unwrap();
         assert!(stream.next().await.is_none());
     }
 
@@ -451,7 +719,7 @@ mod tests {
         write!(file, "{}\n", serde_json::to_string(&TestMutation::Set { value: 1 }).unwrap()).unwrap();
         file.flush().unwrap();
 
-        let result  = MiniStore::stream::<TestMutation>(file.path()).await;
+        let result = MiniStore::stream::<TestMutation>(file.path()).await;
         assert!(matches!(result, Err(MiniStoreError::MissingInitialState)));
     }
 
@@ -465,7 +733,7 @@ mod tests {
         let mut stream: JournalStream<TestMutation> = MiniStore::stream(file.path()).await.unwrap();
         let result = stream.next().await.unwrap();
         assert!(result.is_err());
-        // Проверяем, что ошибка — именно десериализации
+        // Check that error is indeed a deserialization error
         if let Err(MiniStoreError::Deserialize { line: 2, .. }) = result {
             // OK
         } else {
@@ -477,10 +745,90 @@ mod tests {
     async fn test_stream_nonexistent_file() {
         let path = tempfile::tempdir().unwrap().path().join("nonexistent.jsonl");
         let result = MiniStore::stream::<TestMutation>(&path).await;
-        // Ожидаем ошибку I/O (файл не найден)
+        // Expect I/O error (file not found)
         assert!(result.is_err());
-        // Точная ошибка зависит от ОС, но точно не MissingInitialState
+        // Exact error depends on OS, but definitely not MissingInitialState
         assert!(!matches!(result, Err(MiniStoreError::MissingInitialState)));
     }
 
+    #[tokio::test]
+    async fn test_replay_order_with_rotation_and_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rot.log");
+
+        // Very small segment + only 3 files total (2 archived + 1 active)
+        let opts = MiniStoreOptions::new()
+            .max_bytes_per_segment(100) // ~34 records per segment
+            .max_segments(3); // � at most ~812 records retained
+
+        let mut store = MiniStore::open_with_options(&path, opts).await.unwrap();
+
+        // Write many records  some will be dropped
+        let total_written: usize = 20;
+        for i in 0..total_written as u32 {
+            store.append(&TestMutation::Set { value: i }).await.unwrap();
+        }
+
+        // Replay
+        let records: Vec<TestMutation> = MiniStore::replay(&path).await.unwrap();
+
+        // Should retain only the most recent records
+        assert!(records.len() < total_written);
+        assert!(!records.is_empty());
+
+        // Critical check: order among retained records
+        for (idx, record) in records.iter().enumerate() {
+            // Values should be sequential: ..., 17, 18, 19
+            let expected_value = (total_written - records.len() + idx) as u32;
+            assert_eq!(
+                record,
+                &TestMutation::Set { value: expected_value },
+                "At replay index {}: expected {}, got record {:?}",
+                idx,
+                expected_value,
+                record
+            );
+        }
+
+        // Final record must be the latest written
+        if let Some(TestMutation::Set { value: last }) = records.last() {
+            assert_eq!(*last, (total_written - 1) as u32);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_replay_order_within_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rot.log");
+
+        // Sufficiently large limit to retain everything
+        let opts = MiniStoreOptions::new()
+            .max_bytes_per_segment(200) // ~45 records per segment
+            .max_segments(10);
+
+        let mut store = MiniStore::open_with_options(&path, opts).await.unwrap();
+
+        let total: usize = 12;
+        for i in 0..total as u32 {
+            store.append(&TestMutation::Set { value: i }).await.unwrap();
+        }
+
+        // Replay
+        let records: Vec<TestMutation> = MiniStore::replay(&path).await.unwrap();
+        
+        // Verify count
+        assert_eq!(records.len(), total);
+
+        // Critical check: order
+        for (idx, record) in records.iter().enumerate() {
+            assert_eq!(
+                record,
+                &TestMutation::Set { value: idx as u32 },
+                "Record at position {} has wrong value (expected {}, got {})",
+                idx,
+                idx,
+                if let TestMutation::Set { value } = record { *value } else { u32::MAX }
+            );
+        }
+    }
 }
