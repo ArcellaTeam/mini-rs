@@ -461,7 +461,7 @@ impl MiniStore {
         let next_num = segments.last().map(|(n, _)| *n + 1).unwrap_or(1);
 
         // 4. Rename active file
-        let new_segment_path = PathBuf::from(format!("{}.{:03}", self.base_path.display(), next_num));
+        let new_segment_path = PathBuf::from(format!("{}.{:06}", self.base_path.display(), next_num));
         tokio::fs::rename(&self.base_path, &new_segment_path).await?;
 
         // 5. Enforce max_segments: keep only (max_segments - 1) old segments
@@ -546,7 +546,7 @@ async fn collect_segments(base: &Path) -> Result<Vec<(u32, PathBuf)>> {
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-            if ext.len() == 3 && ext.chars().all(|c| c.is_ascii_digit()) {
+            if ext.chars().all(|c| c.is_ascii_digit()) {
                 if path.file_stem() == Some(stem) {
                     if let Ok(num) = ext.parse::<u32>() {
                         segments.push((num, path));
