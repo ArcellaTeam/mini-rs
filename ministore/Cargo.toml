@@ -1,7 +1,7 @@
 # mini-rs/ministore/Cargo.toml
 [package]
 name = "ministore"
-version = "0.1.5"
+version = "0.1.6"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
