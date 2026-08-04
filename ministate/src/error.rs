@@ -7,10 +7,9 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use ministore::MiniStoreError;
-
 #[cfg(feature = "snapshot")]
 use minisnap::MiniSnapError;
+use ministore::MiniStoreError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MiniStateError {
@@ -21,9 +20,9 @@ pub enum MiniStateError {
     },
 
     #[error("Store error: {source}")]
-    Store{
+    Store {
         #[from]
-        source: MiniStoreError
+        source: MiniStoreError,
     },
 
     #[cfg(feature = "snapshot")]
@@ -35,6 +34,5 @@ pub enum MiniStateError {
 
     #[cfg(feature = "snapshot")]
     #[error("Snapshot sequence number too high")]
-    SnapshotSeqTooHigh
-
+    SnapshotSeqTooHigh,
 }

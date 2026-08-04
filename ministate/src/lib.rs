@@ -78,14 +78,16 @@
 //! }
 //! ```
 
-use ministore::MiniStore;
-use serde::{de::DeserializeOwned, Serialize};
-use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
-use tokio::sync::{Mutex, RwLock};
-
 #[cfg(feature = "snapshot")]
 use std::convert::TryFrom;
+use std::{
+    marker::PhantomData,
+    path::{Path, PathBuf},
+};
+
+use ministore::MiniStore;
+use serde::{Serialize, de::DeserializeOwned};
+use tokio::sync::{Mutex, RwLock};
 
 mod error;
 pub use error::MiniStateError;
@@ -205,10 +207,7 @@ where
     /// # }
     /// ```
     #[cfg(not(feature = "snapshot"))]
-    pub async fn open<P1, P2>(
-        state_dir: P1,
-        journal_file: P2
-    ) -> Result<Self, MiniStateError>
+    pub async fn open<P1, P2>(state_dir: P1, journal_file: P2) -> Result<Self, MiniStateError>
     where
         P1: AsRef<Path>,
         P2: AsRef<Path>,
@@ -256,10 +255,7 @@ where
     ///
     /// See [`open_with_snapshot`] for full details.
     #[cfg(feature = "snapshot")]
-    pub async fn open<P1, P2>(
-        state_dir: P1,
-        journal_file: P2
-    ) -> Result<Self, MiniStateError> 
+    pub async fn open<P1, P2>(state_dir: P1, journal_file: P2) -> Result<Self, MiniStateError>
     where
         P1: AsRef<Path>,
         P2: AsRef<Path>,
@@ -351,8 +347,9 @@ where
 
 #[cfg(feature = "snapshot")]
 mod snapshot_support {
-    use super::*;
     use minisnap::SnapStore;
+
+    use super::*;
 
     impl<S, M> StateManager<S, M>
     where
@@ -451,9 +448,8 @@ mod snapshot_support {
             };
 
             // Read sequence number from snapshot.seq
-            let skip_count = usize::try_from(seq)
-                .map_err(|_| MiniStateError::SnapshotSeqTooHigh)?;
-
+            let skip_count =
+                usize::try_from(seq).map_err(|_| MiniStateError::SnapshotSeqTooHigh)?;
 
             // Replay WAL from snapshot.seq onwards
             let all_records: Vec<M> = MiniStore::replay(&journal_path).await?;
@@ -464,10 +460,7 @@ mod snapshot_support {
             }
 
             // Skip records before seq
-            let tail_records = all_records
-                .into_iter()
-                .skip(seq as usize)
-                .collect::<Vec<_>>();
+            let tail_records = all_records.into_iter().skip(seq as usize).collect::<Vec<_>>();
 
             // Apply all records
             for record in &tail_records {
@@ -495,10 +488,12 @@ mod snapshot_support {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde::{Deserialize, Serialize};
     use std::sync::Arc;
+
+    use serde::{Deserialize, Serialize};
     use tempfile::TempDir;
+
+    use super::*;
 
     #[cfg(test)]
     mod base_tests {
@@ -522,9 +517,7 @@ mod tests {
 
         async fn new_tmp_state_manager() -> (TempDir, StateManager<Counter, Inc>) {
             let tmp = tempfile::tempdir().unwrap();
-            let mgr = StateManager::open(tmp.path(), "counter.wal.jsonl")
-                .await
-                .unwrap();
+            let mgr = StateManager::open(tmp.path(), "counter.wal.jsonl").await.unwrap();
             (tmp, mgr)
         }
 
@@ -559,7 +552,8 @@ mod tests {
 
             // First run: apply mutations
             {
-                let mgr: StateManager<Counter, Inc> = StateManager::open(path, "counter.wal.jsonl").await.unwrap();
+                let mgr: StateManager<Counter, Inc> =
+                    StateManager::open(path, "counter.wal.jsonl").await.unwrap();
                 mgr.apply(Inc { by: 100 }).await.unwrap();
                 mgr.apply(Inc { by: 200 }).await.unwrap();
                 assert_eq!(mgr.snapshot().await.value, 300);
@@ -567,7 +561,8 @@ mod tests {
 
             // Second run: recover from WAL
             {
-                let mgr: StateManager<Counter, Inc> = StateManager::open(path, "counter.wal.jsonl").await.unwrap();
+                let mgr: StateManager<Counter, Inc> =
+                    StateManager::open(path, "counter.wal.jsonl").await.unwrap();
                 let state = mgr.snapshot().await;
                 assert_eq!(state.value, 300);
                 assert_eq!(mgr.sequence(), 2);
@@ -595,7 +590,6 @@ mod tests {
             for handle in handles {
                 assert_eq!(handle.await.unwrap(), 42);
             }
-
         }
 
         #[tokio::test]
@@ -625,7 +619,8 @@ mod tests {
         #[tokio::test]
         async fn test_journal_path_and_state_dir() {
             let tmp = tempfile::tempdir().unwrap();
-            let mgr: StateManager<Counter, Inc> = StateManager::open(tmp.path(), "my.wal.jsonl").await.unwrap();
+            let mgr: StateManager<Counter, Inc> =
+                StateManager::open(tmp.path(), "my.wal.jsonl").await.unwrap();
 
             assert_eq!(mgr.journal_path(), tmp.path().join("my.wal.jsonl"));
             assert_eq!(mgr.state_dir(), tmp.path());
@@ -634,9 +629,10 @@ mod tests {
 
     #[cfg(all(test, feature = "snapshot"))]
     mod snapshot_tests {
-        use super::*;
         use serde::{Deserialize, Serialize};
         use tempfile::TempDir;
+
+        use super::*;
 
         #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
         struct Config {
@@ -657,9 +653,7 @@ mod tests {
 
         async fn new_tmp_state_manager() -> (TempDir, StateManager<Config, UpdateVersion>) {
             let tmp = tempfile::tempdir().unwrap();
-            let mgr = StateManager::open(tmp.path(), "config.wal.jsonl")
-                .await
-                .unwrap();
+            let mgr = StateManager::open(tmp.path(), "config.wal.jsonl").await.unwrap();
             (tmp, mgr)
         }
 
@@ -677,13 +671,12 @@ mod tests {
             assert!(snap_path.exists());
 
             let _content = tokio::fs::read_to_string(&snap_path).await.unwrap();
-            
-            let snap_store = minisnap::SnapStore::new(mgr.state_dir());            
+
+            let snap_store = minisnap::SnapStore::new(mgr.state_dir());
             let (restored_state, restored_seq) = snap_store.restore::<Config>().await.unwrap();
 
             assert_eq!(restored_state.version, 84);
             assert_eq!(restored_seq, 2);
-
         }
 
         #[tokio::test]
@@ -693,7 +686,8 @@ mod tests {
 
             // 1. Create state and snapshot
             {
-                let mgr: StateManager<Config, UpdateVersion> = StateManager::open(path, "test.wal.jsonl").await.unwrap();
+                let mgr: StateManager<Config, UpdateVersion> =
+                    StateManager::open(path, "test.wal.jsonl").await.unwrap();
                 mgr.apply(UpdateVersion { to: 10 }).await.unwrap(); // seq=1
                 mgr.apply(UpdateVersion { to: 20 }).await.unwrap(); // seq=2
                 mgr.create_snapshot().await.unwrap();
@@ -702,7 +696,8 @@ mod tests {
 
             // 2. Recover from snapshot and WAL tail - should be 30
             {
-                let mgr: StateManager<Config, UpdateVersion> = StateManager::open(path, "test.wal.jsonl").await.unwrap();
+                let mgr: StateManager<Config, UpdateVersion> =
+                    StateManager::open(path, "test.wal.jsonl").await.unwrap();
                 assert_eq!(mgr.snapshot().await.version, 30);
                 assert_eq!(mgr.sequence(), 3);
             }

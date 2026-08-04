@@ -1,0 +1,19 @@
+unstable_features = true
+edition = "2024"
+
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+imports_layout = "HorizontalVertical"
+
+merge_derives = false
+reorder_impl_items = true
+use_field_init_shorthand = true
+
+blank_lines_upper_bound = 2
+max_width = 100
+match_arm_blocks = false
+match_block_trailing_comma = true
+
+use_small_heuristics = "Max"
+struct_lit_width = 30
+enum_discrim_align_threshold = 20

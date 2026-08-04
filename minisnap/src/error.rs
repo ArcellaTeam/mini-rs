@@ -7,8 +7,9 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use serde_json;
 use std::path::PathBuf;
+
+use serde_json;
 use thiserror::Error;
 
 /// Error type for `minisnap` operations.

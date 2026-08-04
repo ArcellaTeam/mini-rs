@@ -50,8 +50,9 @@
 //! }
 //! ```
 
-use serde::{de::DeserializeOwned, Serialize};
 use std::path::{Path, PathBuf};
+
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::{fs, io::AsyncWriteExt};
 
 mod error;
@@ -128,18 +129,21 @@ impl SnapStore {
         {
             let state_json = serde_json::to_string_pretty(state)?;
 
-            let mut tmp_file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .open(&state_tmp)
-                .await
-                .map_err(|e| MiniSnapError::Io { source: e, path: state_tmp.clone() })?;
-            tmp_file.write(state_json.as_bytes())
-                .await
-                .map_err(|e| MiniSnapError::Io { source: e, path: state_tmp.clone() })?;
-            tmp_file.sync_all()
-                .await
-                .map_err(|e| MiniSnapError::Io { source: e, path: state_tmp.clone() })?;
+            let mut tmp_file =
+                fs::OpenOptions::new().write(true).create(true).open(&state_tmp).await.map_err(
+                    |e| MiniSnapError::Io {
+                        source: e,
+                        path: state_tmp.clone(),
+                    },
+                )?;
+            tmp_file.write(state_json.as_bytes()).await.map_err(|e| MiniSnapError::Io {
+                source: e,
+                path: state_tmp.clone(),
+            })?;
+            tmp_file.sync_all().await.map_err(|e| MiniSnapError::Io {
+                source: e,
+                path: state_tmp.clone(),
+            })?;
         }
 
         // Write sequence to temp file
@@ -147,18 +151,21 @@ impl SnapStore {
         {
             let seq_string = seq.to_string();
 
-            let mut seq_file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .open(&seq_tmp)
-                .await
-                .map_err(|e| MiniSnapError::Io { source: e, path: seq_tmp.clone() })?;
-            seq_file.write(seq_string.as_bytes())
-                .await
-                .map_err(|e| MiniSnapError::Io { source: e, path: seq_tmp.clone() })?;
-            seq_file.sync_all()
-                .await
-                .map_err(|e| MiniSnapError::Io { source: e, path: seq_tmp.clone() })?;
+            let mut seq_file =
+                fs::OpenOptions::new().write(true).create(true).open(&seq_tmp).await.map_err(
+                    |e| MiniSnapError::Io {
+                        source: e,
+                        path: seq_tmp.clone(),
+                    },
+                )?;
+            seq_file.write(seq_string.as_bytes()).await.map_err(|e| MiniSnapError::Io {
+                source: e,
+                path: seq_tmp.clone(),
+            })?;
+            seq_file.sync_all().await.map_err(|e| MiniSnapError::Io {
+                source: e,
+                path: seq_tmp.clone(),
+            })?;
         }
 
         // Atomic rename
@@ -191,17 +198,20 @@ impl SnapStore {
         S: DeserializeOwned,
     {
         // Read state
-        let state_json = fs::read_to_string(&self.snapshot_path)
-            .await
-            .map_err(|e| MiniSnapError::Io { source: e, path: self.snapshot_path.clone() })?;
+        let state_json =
+            fs::read_to_string(&self.snapshot_path).await.map_err(|e| MiniSnapError::Io {
+                source: e,
+                path: self.snapshot_path.clone(),
+            })?;
         let state: S = serde_json::from_str(&state_json)?;
 
         // Read sequence
-        let seq_str = fs::read_to_string(&self.metadata_path)
-            .await
-            .map_err(|e| MiniSnapError::Io { source: e, path: self.metadata_path.clone() })?;
-        let seq = seq_str.trim().parse::<u64>()
-            .map_err(|_| MiniSnapError::InvalidSequence)?;
+        let seq_str =
+            fs::read_to_string(&self.metadata_path).await.map_err(|e| MiniSnapError::Io {
+                source: e,
+                path: self.metadata_path.clone(),
+            })?;
+        let seq = seq_str.trim().parse::<u64>().map_err(|_| MiniSnapError::InvalidSequence)?;
 
         Ok((state, seq))
     }
@@ -221,9 +231,10 @@ impl SnapStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde::{Deserialize};
+    use serde::Deserialize;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
     struct TestState {
@@ -272,9 +283,7 @@ mod tests {
 
         // Create only snapshot.json, but not snapshot.seq
         fs::create_dir_all(&store.dir).await.unwrap();
-        fs::write(&store.snapshot_path, r#"{"counter":1,"message":"test"}"#)
-            .await
-            .unwrap();
+        fs::write(&store.snapshot_path, r#"{"counter":1,"message":"test"}"#).await.unwrap();
 
         let err = store.restore::<TestState>().await.unwrap_err();
         // Must be an error when reading snapshot.seq
@@ -287,12 +296,8 @@ mod tests {
         let store = SnapStore::new(tmp.path());
 
         fs::create_dir_all(&store.dir).await.unwrap();
-        fs::write(&store.snapshot_path, r#"{"counter":1,"message":"test"}"#)
-            .await
-            .unwrap();
-        fs::write(&store.metadata_path, "not-a-number")
-            .await
-            .unwrap();
+        fs::write(&store.snapshot_path, r#"{"counter":1,"message":"test"}"#).await.unwrap();
+        fs::write(&store.metadata_path, "not-a-number").await.unwrap();
 
         let err = store.restore::<TestState>().await.unwrap_err();
         assert!(matches!(err, MiniSnapError::InvalidSequence));
@@ -304,12 +309,8 @@ mod tests {
         let store = SnapStore::new(tmp.path());
 
         fs::create_dir_all(&store.dir).await.unwrap();
-        fs::write(&store.snapshot_path, r#"{"counter": invalid json}"#)
-            .await
-            .unwrap();
-        fs::write(&store.metadata_path, "123")
-            .await
-            .unwrap();
+        fs::write(&store.snapshot_path, r#"{"counter": invalid json}"#).await.unwrap();
+        fs::write(&store.metadata_path, "123").await.unwrap();
 
         let err = store.restore::<TestState>().await.unwrap_err();
         assert!(matches!(err, MiniSnapError::Serde { .. }));
@@ -347,9 +348,7 @@ mod tests {
         let _seq_tmp = store.metadata_path.with_extension("seq.tmp");
 
         fs::create_dir_all(&store.dir).await.unwrap();
-        fs::write(&state_tmp, r#"{"counter":999,"message":"partial"}"#)
-            .await
-            .unwrap();
+        fs::write(&state_tmp, r#"{"counter":999,"message":"partial"}"#).await.unwrap();
         // seq_tmp NOT created → imitation failure
 
         // Try to restore should fail due to missing sequence file
@@ -398,9 +397,7 @@ mod tests {
 
         // Create only snapshot.json
         fs::create_dir_all(&store.dir).await.unwrap();
-        fs::write(&store.snapshot_path, r#"{"counter":1,"message":"test"}"#)
-            .await
-            .unwrap();
+        fs::write(&store.snapshot_path, r#"{"counter":1,"message":"test"}"#).await.unwrap();
         assert!(!store.exists().await); // still false — seq missing
 
         // Create only snapshot.seq
@@ -409,10 +406,7 @@ mod tests {
         assert!(!store.exists().await); // still false — json missing
 
         // Create both files → exists() == true
-        fs::write(&store.snapshot_path, r#"{"counter":1,"message":"test"}"#)
-            .await
-            .unwrap();
+        fs::write(&store.snapshot_path, r#"{"counter":1,"message":"test"}"#).await.unwrap();
         assert!(store.exists().await);
     }
-
 }
