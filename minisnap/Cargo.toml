@@ -13,9 +13,9 @@ categories = ["database-implementations", "filesystem"]
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
