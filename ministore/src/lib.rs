@@ -384,7 +384,7 @@ impl MiniStore {
         while let Some(entry) = read_dir.next_entry().await? {
             let p = entry.path();
             if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                if ext.len() == 3 && ext.chars().all(|c| c.is_ascii_digit()) {
+                if ext.chars().all(|c| c.is_ascii_digit()) {
                     if p.file_stem() == Some(stem) {
                         if let Ok(num) = ext.parse::<u32>() {
                             segments.push((num, p));
