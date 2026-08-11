@@ -179,23 +179,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "minisnap"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa53a6dccb752791bc3cc33ddb4796b9783db92316aebd36c35aae531dfd5960"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "ministate"
 version = "0.1.2"
 dependencies = [
- "minisnap 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
- "ministore 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "minisnap",
+ "ministore",
  "serde",
  "serde_json",
  "tempfile",
@@ -210,18 +198,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "ministore"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d143948be4855457112206d5e016ac18901d652ea29e43c1c528136935aa6081"
-dependencies = [
- "serde",
- "serde_json",
  "thiserror",
  "tokio",
 ]
