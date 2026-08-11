@@ -34,11 +34,8 @@ pub enum MiniStoreError {
     MissingInitialState,
 
     #[error("Path must be a file, got: {path:?}")]
-    PathIsNotFile {
-        path: PathBuf,
-    },
+    PathIsNotFile { path: PathBuf },
 
     #[error("Invalid argument: {0}")]
-    InvalidArgument(String)
-
+    InvalidArgument(String),
 }

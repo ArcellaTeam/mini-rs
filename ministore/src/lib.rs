@@ -100,11 +100,14 @@
 //! }
 //! ```
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
+use std::{
+    marker::PhantomData,
+    path::{Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
-    fs::{OpenOptions, File},
+    fs::{File, OpenOptions},
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Lines},
 };
 
@@ -238,9 +241,7 @@ impl MiniStore {
     /// Returns `MiniStoreError::InvalidArgument` if `max_segments == 0`.
     async fn open_with_options<P: AsRef<Path>>(path: P, opts: MiniStoreOptions) -> Result<Self> {
         if opts.max_segments == 0 {
-            return Err(MiniStoreError::InvalidArgument(
-                "max_segments must be >= 1".into(),
-            ));
+            return Err(MiniStoreError::InvalidArgument("max_segments must be >= 1".into()));
         }
 
         let path = path.as_ref();
@@ -251,18 +252,11 @@ impl MiniStore {
         }
 
         // Open file in write+append mode
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
+        let file = OpenOptions::new().write(true).create(true).append(true).open(path).await?;
 
         let metadata = file.metadata().await?;
         if metadata.is_dir() {
-            return Err(MiniStoreError::PathIsNotFile {
-                path: path.to_path_buf(),
-            });
+            return Err(MiniStoreError::PathIsNotFile { path: path.to_path_buf() });
         }
         let mut journal_writer = BufWriter::new(file);
 
@@ -314,15 +308,9 @@ impl MiniStore {
     {
         let json = serde_json::to_string(record)?;
 
-        let writer = self
-            .journal_writer
-            .as_mut()
-            .ok_or(MiniStoreError::Io {
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "journal closed",
-                ),
-            })?;
+        let writer = self.journal_writer.as_mut().ok_or(MiniStoreError::Io {
+            source: std::io::Error::new(std::io::ErrorKind::NotConnected, "journal closed"),
+        })?;
 
         writer.write_all(json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
@@ -391,7 +379,7 @@ impl MiniStore {
                         format!("Failed to read directory {:?}: {}", dir, e),
                     ),
                 });
-            }
+            },
         };
         while let Some(entry) = read_dir.next_entry().await? {
             let p = entry.path();
@@ -439,15 +427,9 @@ impl MiniStore {
     ///
     /// Returns I/O errors if rename, create, or delete fails.
     async fn rotate(&mut self) -> Result<()> {
-        let old_writer = self
-            .journal_writer
-            .take()
-            .ok_or(MiniStoreError::Io {
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "journal closed",
-                ),
-            })?;
+        let old_writer = self.journal_writer.take().ok_or(MiniStoreError::Io {
+            source: std::io::Error::new(std::io::ErrorKind::NotConnected, "journal closed"),
+        })?;
 
         // 1. fsync and close
         let old_file = old_writer.into_inner();
@@ -461,7 +443,8 @@ impl MiniStore {
         let next_num = segments.last().map(|(n, _)| *n + 1).unwrap_or(1);
 
         // 4. Rename active file
-        let new_segment_path = PathBuf::from(format!("{}.{:06}", self.base_path.display(), next_num));
+        let new_segment_path =
+            PathBuf::from(format!("{}.{:06}", self.base_path.display(), next_num));
         tokio::fs::rename(&self.base_path, &new_segment_path).await?;
 
         // 5. Enforce max_segments: keep only (max_segments - 1) old segments
@@ -476,11 +459,8 @@ impl MiniStore {
         }
 
         // 6. Create new active file
-        let new_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.base_path)
-            .await?;
+        let new_file =
+            OpenOptions::new().write(true).create_new(true).open(&self.base_path).await?;
 
         let mut new_writer = BufWriter::new(new_file);
         new_writer.write_all(JOURNAL_MAGIC_CURRENT.as_bytes()).await?;
@@ -524,10 +504,7 @@ impl MiniStore {
 ///
 /// Returns `MiniStoreError::MissingInitialState` if header is missing or invalid.
 async fn validate_magic_header(lines: &mut Lines<BufReader<File>>) -> Result<()> {
-    let magic = lines
-        .next_line()
-        .await?
-        .ok_or(MiniStoreError::MissingInitialState)?;
+    let magic = lines.next_line().await?.ok_or(MiniStoreError::MissingInitialState)?;
     if !magic.starts_with(JOURNAL_MAGIC_PREFIX) {
         return Err(MiniStoreError::MissingInitialState);
     }
@@ -574,10 +551,7 @@ async fn read_records_from_file<R: DeserializeOwned>(
     let mut lines = reader.lines();
 
     // Validate magic header (line 1)
-    let magic = lines
-        .next_line()
-        .await?
-        .ok_or(MiniStoreError::MissingInitialState)?;
+    let magic = lines.next_line().await?.ok_or(MiniStoreError::MissingInitialState)?;
     if !magic.starts_with(JOURNAL_MAGIC_PREFIX) {
         return Err(MiniStoreError::MissingInitialState);
     }
@@ -588,13 +562,10 @@ async fn read_records_from_file<R: DeserializeOwned>(
             Ok(record) => {
                 records.push(record);
                 count += 1;
-            }
+            },
             Err(e) => {
-                return Err(MiniStoreError::Deserialize {
-                    line: line_num,
-                    source: e,
-                });
-            }
+                return Err(MiniStoreError::Deserialize { line: line_num, source: e });
+            },
         }
         line_num += 1;
     }
@@ -621,23 +592,21 @@ where
     /// Returns `Some(Err(...))` on I/O or deserialization error.
     pub async fn next(&mut self) -> Option<Result<T>> {
         match self.lines.next_line().await {
-            Ok(Some(line)) => {
-                match serde_json::from_str(&line) {
-                    Ok(t) => {
-                        let record = Ok(t);
-                        self.line_number += 1;
-                        Some(record)
-                    }
-                    Err(e) => {
-                        let err = MiniStoreError::Deserialize {
-                            line: self.line_number as usize,
-                            source: e,
-                        };
-                        self.line_number += 1;
-                        Some(Err(err))
-                    }
-                }
-            }
+            Ok(Some(line)) => match serde_json::from_str(&line) {
+                Ok(t) => {
+                    let record = Ok(t);
+                    self.line_number += 1;
+                    Some(record)
+                },
+                Err(e) => {
+                    let err = MiniStoreError::Deserialize {
+                        line: self.line_number as usize,
+                        source: e,
+                    };
+                    self.line_number += 1;
+                    Some(Err(err))
+                },
+            },
             Ok(None) => None,
             Err(e) => Some(Err(MiniStoreError::Io { source: e })),
         }
@@ -646,10 +615,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde::{Deserialize, Serialize};
     use std::io::Write;
+
+    use serde::{Deserialize, Serialize};
     use tempfile::NamedTempFile;
+
+    use super::*;
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     enum TestMutation {
@@ -687,7 +658,8 @@ mod tests {
     async fn test_stream_success() {
         let mut file = NamedTempFile::new().unwrap();
         write!(file, "{}", JOURNAL_MAGIC_CURRENT).unwrap();
-        write!(file, "{}\n", serde_json::to_string(&TestMutation::Set { value: 10 }).unwrap()).unwrap();
+        write!(file, "{}\n", serde_json::to_string(&TestMutation::Set { value: 10 }).unwrap())
+            .unwrap();
         write!(file, "{}\n", serde_json::to_string(&TestMutation::Inc { by: 5 }).unwrap()).unwrap();
         file.flush().unwrap();
 
@@ -716,7 +688,8 @@ mod tests {
     #[tokio::test]
     async fn test_stream_missing_magic_header() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "{}\n", serde_json::to_string(&TestMutation::Set { value: 1 }).unwrap()).unwrap();
+        write!(file, "{}\n", serde_json::to_string(&TestMutation::Set { value: 1 }).unwrap())
+            .unwrap();
         file.flush().unwrap();
 
         let result = MiniStore::stream::<TestMutation>(file.path()).await;
@@ -815,7 +788,7 @@ mod tests {
 
         // Replay
         let records: Vec<TestMutation> = MiniStore::replay(&path).await.unwrap();
-        
+
         // Verify count
         assert_eq!(records.len(), total);
 
