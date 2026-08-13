@@ -108,7 +108,7 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Lines},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
 };
 
 mod error;
@@ -204,8 +204,8 @@ pub struct MiniStore {
     base_path: PathBuf,
     /// Rotation and size configuration.
     opts: MiniStoreOptions,
-    /// Buffered writer to the active journal file.
-    journal_writer: Option<BufWriter<File>>,
+    /// Direct writer to the active journal file (unbuffered for strict fsync guarantees).
+    journal_file: Option<File>,
     /// Current size of the active journal in bytes (including header).
     current_size: u64,
 }
@@ -252,28 +252,25 @@ impl MiniStore {
         }
 
         // Open file in write+append mode
-        let file = OpenOptions::new().write(true).create(true).append(true).open(path).await?;
+        let mut file = OpenOptions::new().write(true).create(true).append(true).open(path).await?;
 
         let metadata = file.metadata().await?;
         if metadata.is_dir() {
             return Err(MiniStoreError::PathIsNotFile { path: path.to_path_buf() });
         }
-        let mut journal_writer = BufWriter::new(file);
-
         let mut current_size = metadata.len();
 
         // Initialize empty file with magic header
         if metadata.len() == 0 {
-            journal_writer.write_all(JOURNAL_MAGIC_CURRENT.as_bytes()).await?;
-            journal_writer.flush().await?;
-            journal_writer.get_ref().sync_all().await?;
+            file.write_all(JOURNAL_MAGIC_CURRENT.as_bytes()).await?;
+            file.sync_all().await?;
             current_size = JOURNAL_MAGIC_CURRENT.len() as u64;
         }
 
         Ok(Self {
             base_path: path.to_path_buf(),
             opts,
-            journal_writer: Some(journal_writer),
+            journal_file: Some(file),
             current_size,
         })
     }
@@ -281,7 +278,7 @@ impl MiniStore {
     /// Appends a serializable record to the journal and ensures it is durably stored.
     ///
     /// The record is serialized as a single JSON line and immediately `fsync`ed to disk.
-    /// This operation is **atomic**  either the entire record is written, or nothing is.
+    /// This operation is **atomic** - either the entire record is written, or nothing is.
     ///
     /// If the active segment exceeds `max_bytes_per_segment`, it is rotated before return.
     ///
@@ -309,13 +306,12 @@ impl MiniStore {
         let mut json_bytes = serde_json::to_vec(record)?;
         json_bytes.push(b'\n');
 
-        let writer = self.journal_writer.as_mut().ok_or(MiniStoreError::Io {
+        let file = self.journal_file.as_mut().ok_or(MiniStoreError::Io {
             source: std::io::Error::new(std::io::ErrorKind::NotConnected, "journal closed"),
         })?;
 
-        writer.write_all(&json_bytes).await?;
-        writer.flush().await?;
-        writer.get_ref().sync_all().await?;
+        file.write_all(&json_bytes).await?;
+        file.sync_all().await?;
 
         self.current_size += json_bytes.len() as u64;
 
@@ -400,12 +396,11 @@ impl MiniStore {
     ///
     /// Returns I/O errors if rename, create, or delete fails.
     async fn rotate(&mut self) -> Result<()> {
-        let old_writer = self.journal_writer.take().ok_or(MiniStoreError::Io {
+        let old_file = self.journal_file.take().ok_or(MiniStoreError::Io {
             source: std::io::Error::new(std::io::ErrorKind::NotConnected, "journal closed"),
         })?;
 
         // 1. fsync and close
-        let old_file = old_writer.into_inner();
         old_file.sync_all().await?;
         drop(old_file);
 
@@ -432,15 +427,13 @@ impl MiniStore {
         }
 
         // 6. Create new active file
-        let new_file =
+        let mut new_file =
             OpenOptions::new().write(true).create_new(true).open(&self.base_path).await?;
 
-        let mut new_writer = BufWriter::new(new_file);
-        new_writer.write_all(JOURNAL_MAGIC_CURRENT.as_bytes()).await?;
-        new_writer.flush().await?;
-        new_writer.get_ref().sync_all().await?;
+        new_file.write_all(JOURNAL_MAGIC_CURRENT.as_bytes()).await?;
+        new_file.sync_all().await?;
 
-        self.journal_writer = Some(new_writer);
+        self.journal_file = Some(new_file);
         self.current_size = JOURNAL_MAGIC_CURRENT.len() as u64;
 
         Ok(())
