@@ -39,7 +39,7 @@
 //! {"Inc":{"by":5}}
 //! ```
 //! - Line 1: magic header (for versioning and validation).
-//! - Line N (N e 2): one JSON-serialized record per line.
+//! - Line N (N >= 2): one JSON-serialized record per line.
 //!
 //! The format is human-readable and easy to inspect/debug with standard tools (`cat`, `jq`, etc.).
 //!
@@ -306,19 +306,18 @@ impl MiniStore {
     where
         R: Serialize,
     {
-        let json = serde_json::to_string(record)?;
+        let mut json_bytes = serde_json::to_vec(record)?;
+        json_bytes.push(b'\n');
 
         let writer = self.journal_writer.as_mut().ok_or(MiniStoreError::Io {
             source: std::io::Error::new(std::io::ErrorKind::NotConnected, "journal closed"),
         })?;
 
-        writer.write_all(json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
+        writer.write_all(&json_bytes).await?;
         writer.flush().await?;
         writer.get_ref().sync_all().await?;
 
-        let record_size = json.len() as u64 + 1;
-        self.current_size += record_size;
+        self.current_size += json_bytes.len() as u64;
 
         if self.current_size >= self.opts.max_bytes_per_segment {
             self.rotate().await?;
@@ -361,39 +360,13 @@ impl MiniStore {
     {
         let path = path.as_ref();
         let dir = path.parent().unwrap_or(Path::new("."));
-        let stem = path.file_name().unwrap_or_default();
 
         if !dir.exists() {
             return Ok(vec![]);
         }
 
-        // Collect and sort archived segments: journal.jsonl.001, .002, ...
-        let mut segments: Vec<(u32, PathBuf)> = vec![];
-        let read_dir_result = tokio::fs::read_dir(dir).await;
-        let mut read_dir = match read_dir_result {
-            Ok(rd) => rd,
-            Err(e) => {
-                return Err(MiniStoreError::Io {
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to read directory {:?}: {}", dir, e),
-                    ),
-                });
-            },
-        };
-        while let Some(entry) = read_dir.next_entry().await? {
-            let p = entry.path();
-            if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                if ext.chars().all(|c| c.is_ascii_digit()) {
-                    if p.file_stem() == Some(stem) {
-                        if let Ok(num) = ext.parse::<u32>() {
-                            segments.push((num, p));
-                        }
-                    }
-                }
-            }
-        }
-        segments.sort_by_key(|(n, _)| *n);
+        // Collect existing segments
+        let segments = collect_segments(path).await?;        
 
         let mut current_line_num = 2; // magic = line 1
         let mut all_records = Vec::new();
@@ -517,14 +490,14 @@ async fn validate_magic_header(lines: &mut Lines<BufReader<File>>) -> Result<()>
 async fn collect_segments(base: &Path) -> Result<Vec<(u32, PathBuf)>> {
     let mut segments = Vec::new();
     let dir = base.parent().unwrap_or(Path::new("."));
-    let stem = base.file_name().unwrap_or_default();
+    let file_name = base.file_name().unwrap_or_default();
 
     let mut entries = tokio::fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
             if ext.chars().all(|c| c.is_ascii_digit()) {
-                if path.file_stem() == Some(stem) {
+                if path.file_stem() == Some(file_name) {
                     if let Ok(num) = ext.parse::<u32>() {
                         segments.push((num, path));
                     }
@@ -731,12 +704,12 @@ mod tests {
 
         // Very small segment + only 3 files total (2 archived + 1 active)
         let opts = MiniStoreOptions::new()
-            .max_bytes_per_segment(100) // ~34 records per segment
-            .max_segments(3); // � at most ~812 records retained
+            .max_bytes_per_segment(100) // ~3-4 records per segment
+            .max_segments(3); // � at most ~8-12 records retained
 
         let mut store = MiniStore::open_with_options(&path, opts).await.unwrap();
 
-        // Write many records  some will be dropped
+        // Write many records some will be dropped
         let total_written: usize = 20;
         for i in 0..total_written as u32 {
             store.append(&TestMutation::Set { value: i }).await.unwrap();
@@ -776,7 +749,7 @@ mod tests {
 
         // Sufficiently large limit to retain everything
         let opts = MiniStoreOptions::new()
-            .max_bytes_per_segment(200) // ~45 records per segment
+            .max_bytes_per_segment(200) // ~4-5 records per segment
             .max_segments(10);
 
         let mut store = MiniStore::open_with_options(&path, opts).await.unwrap();
